@@ -437,6 +437,33 @@ def test_auto_across_strategy_explicit_models_train_identically():
 
     assert len(set(losses.values())) == 1, losses
 
+# each modality instance gets its own time (`default_modality_length_to_time_fn`) - loss must be identical across strategies
+
+def test_distinct_times_per_instance():
+    from unittest import mock
+
+    from transfusion_pytorch.modality_processing import scan_batch_for_structure
+
+    batch = make_batch(num_images = 2)
+    times = tensor([[0.5, 0.9], [0.3, 0.7]])
+
+    # the k-th modality of a sample must read `times[b, k]`, in order - not `times[b, 0]` for all
+
+    records, _ = scan_batch_for_structure(batch, times, build_model())
+
+    assert torch.allclose(torch.stack([record.time for record in records]), times.flatten())
+
+    losses = dict()
+
+    for strategy in ('naive', 'grouped', 'flat', 'hybrid', 'auto'):
+        torch.manual_seed(1)
+        model = build_model(modality_processing = strategy)
+
+        with mock.patch('torch.randn_like', side_effect = lambda t: torch.zeros_like(t)):
+            losses[strategy] = model(batch, times = times).item()
+
+    assert len(set(losses.values())) == 1, losses
+
 # unet style (downsampling) encoders - token lengths must be derived from the *projected*
 # tokens, not the raw input shapes, matching the reference `naive` strategy
 

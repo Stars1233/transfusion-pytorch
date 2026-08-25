@@ -387,7 +387,6 @@ def process_modality_batch_naive(
 ) -> ProcessedModalityBatch:
 
     # reference implementation, mirroring the original per-instance loop in `Transfusion.forward`
-    # note: the original (incorrectly) read only the first column of `times` for all modalities in a sample
 
     device = model.device
     dim = model.dim
@@ -457,8 +456,10 @@ def process_modality_batch_naive(
                 continue
 
             # otherwise handle a modality
+            # each modality instance gets its own time column, indexed by its position in the sample
 
             modality_time = times[batch_index, modality_index]
+            modality_index += 1
 
             # noise
 
@@ -565,8 +566,6 @@ def process_modality_batch_naive(
 
         modality_tokens.append(cat(batch_modality_tokens))
         modality_positions.append(batch_modality_positions)
-
-        modality_index += 1 # original code incremented this per sample, not per modality instance - so all modalities in a sample read times[batch, sample_ordinal] (a bug kept for reference)
 
     total_tokens = sum([t.numel() for t in text]) if return_loss else None
 
