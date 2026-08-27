@@ -54,12 +54,15 @@ from torch_einops_utils import (
     pad_left_at_dim,
     pad_right_at_dim,
     pad_sequence,
-    batched_index_select
+    batched_index_select,
 )
 
 from .modality_processing import (
     ModalitySample,
+    ModalityItem,
     GetPredFlows,
+    parse_modality_item,
+    to_named_modality_item,
     get_model_output_to_flow_fn,
     evaluate_modality_pos_emb,
     get_cached_meta_tokens,
@@ -153,6 +156,17 @@ def cast_tuple(t, length = 1):
 def is_int_tensor(t):
     return is_tensor(t) and t.dtype in (torch.int, torch.long)
 
+def null_text_tokens(item, null_text_id):
+    # null any text in a sample item for the unconditional CFG branch - flags untouched
+
+    if isinstance(item, tuple) and is_int_tensor(item[0]):
+        return (torch.full_like(item[0], null_text_id), *item[1:])
+
+    if is_int_tensor(item):
+        return torch.full_like(item, null_text_id)
+
+    return item
+
 def set_dropout_(model: Module, prob: float):
     for module in model.modules():
         if isinstance(module, nn.Dropout):
@@ -222,14 +236,34 @@ def concat_contiguous_text(
 
     return output
 
+def to_named_modality_items(
+    samples: ModalitySample | list[ModalitySample]
+) -> ModalitySample | list[ModalitySample]:
+    # swap modality tuple items with their named equivalents, so a sample can be read directly
+    # by attribute, e.g. `samples[0][2].tensor`
+
+    if samples and isinstance(samples[0], list):
+        return [to_named_modality_items(sample) for sample in samples]
+
+    for i, sample in enumerate(samples):
+        if isinstance(sample, tuple):
+            named_item = to_named_modality_item(sample)
+
+            if exists(named_item):
+                samples[i] = named_item
+
+    return samples
+
 def print_modality_sample(
     modality_sample: ModalitySample
 ):
     output = []
 
     for sample in modality_sample:
-        if isinstance(sample, tuple):
-            modality_type, sample = sample
+        if isinstance(sample, ModalityItem):
+            output.append((f'modality:{sample.modality_type}', sample.tensor.shape))
+        elif isinstance(sample, tuple):
+            modality_type, sample, *_ = sample
             output.append((f'modality:{modality_type}', sample.shape))
         elif is_int_tensor(sample):
             output.append(('text', sample.shape))
@@ -312,6 +346,27 @@ def create_dataloader(dataset: Dataset, **kwargs) -> DataLoader:
 # flex attention mask construction
 # https://pytorch.org/blog/flexattention/
 
+def flow_weight_vector(instance_weights: list[float | Tensor], flow_tensors: list[Tensor], channel_first: bool) -> Float['t']:
+    # per instance loss weights -> a per-token weight vector, already shaped to broadcast over
+    # the packed flow tiles along the feature axis
+
+    per_token = []
+
+    for weight, flow_tensor in zip(instance_weights, flow_tensors):
+        if is_tensor(weight):
+            per_token.append(weight.reshape(-1))
+        else:
+            channel_axis = 0 if channel_first else -1
+            token_count = flow_tensor.numel() // flow_tensor.shape[channel_axis]
+            per_token.append(torch.full((token_count,), weight, device = flow_tensor.device, dtype = torch.float))
+
+    weight = cat(per_token)
+
+    if channel_first:
+        return rearrange(weight, 't -> 1 t')
+
+    return rearrange(weight, 't -> t 1')
+
 def causal(b, h, q_idx, kv_idx):
     return q_idx >= kv_idx
 
@@ -322,7 +377,14 @@ def modality(offset, length):
 
     return mask_fn
 
-def transfusion_attn_mask(modalities: Int['b m 3']):
+def excluded(start, end):
+
+    def mask_fn(b, h, q_idx, kv_idx):
+        return ~(((q_idx >= start) & (q_idx < end)) | ((kv_idx >= start) & (kv_idx < end)))
+
+    return mask_fn
+
+def transfusion_attn_mask(modalities: Int['b m 3'], excluded_spans: Int['b m 2'] | None = None):
     modalities = modalities.long()
 
     def mask_mod(b, h, q_idx, kv_idx):
@@ -332,6 +394,10 @@ def transfusion_attn_mask(modalities: Int['b m 3']):
 
         for _, offset, length in modality_batch:
             mask = mask | modality(offset, length)(b, h, q_idx, kv_idx)
+
+        if exists(excluded_spans):
+            for start, end in excluded_spans[b]:
+                mask = mask & excluded(start, end)(b, h, q_idx, kv_idx)
 
         return mask
 
@@ -453,7 +519,8 @@ def modality_positions_to_is_modality_mask(
 def naive_attn_mask(
     seq_len: int,
     modalities: Int['b m 3'],
-    device = None
+    device = None,
+    excluded_spans: Int['b m 2'] | None = None
 ) -> Bool['b i j']:
 
     _, offsets, length = modalities.unbind(dim = -1)
@@ -467,7 +534,18 @@ def naive_attn_mask(
         einx.less('j, b m -> b m 1 j', seq, offsets + length)
     )
 
-    return is_causal | is_modality.any(dim = 1)
+    mask = is_causal | is_modality.any(dim = 1)
+
+    if exists(excluded_spans):
+        starts, ends = excluded_spans.unbind(dim = -1)
+        is_excluded = (
+            einx.greater_equal('i, b m -> b m i', seq, starts) &
+            einx.less('j, b m -> b m j', seq, ends)
+        )
+        is_excluded = is_excluded.any(dim = 1)
+        mask = mask & ~einx.logical_or('b i, b j -> b i j', is_excluded, is_excluded)
+
+    return mask
 
 # unet encoder related function
 
@@ -548,17 +626,29 @@ def apply_fn_modality_type(
 
     modalities, tree_spec = tree_flatten(modalities, is_leaf = lambda el: isinstance(el, tuple))
 
-    # standardize tuples to (<modality_type>, <modality_tensor>)
+    # standardize tuples to (<modality_type>, <modality_tensor>[, <loss weight>]);
 
-    modalities = [(0, m) if (is_tensor(m) and m.is_floating_point()) else m for m in modalities]
+    def to_standardized(m):
+        if not isinstance(m, tuple) or not is_tensor(m[0]) or not m[0].is_floating_point():
+            return (0, m) if (is_tensor(m) and m.is_floating_point()) else m
 
-    # filter for specific modality type to transform
+        # bare (tensor[, loss weight]) form - implicitly modality type 0
 
-    modalities, inverse_filter = filter_with_inverse(lambda el: isinstance(el, tuple) and el[0] == modality_type, modalities)
+        return (0, m[0], m[1] if len(m) > 1 else None)
 
-    # remove the type
+    modalities = [to_standardized(m) for m in modalities]
 
-    modalities = [m for _, m in modalities]
+    # filter by type - text (tensor[, flag]) tuples have an int tensor first, so never match
+
+    modalities, inverse_filter = filter_with_inverse(
+        lambda el: isinstance(el, tuple) and isinstance(el[0], int) and el[0] == modality_type,
+        modalities
+    )
+
+    # keep the type and spec separate so both survive the transform
+
+    type_and_specs = [(m[0], m[2] if len(m) > 2 else None) for m in modalities]
+    modalities = [m[1] for m in modalities]
 
     # batch process
 
@@ -571,9 +661,15 @@ def apply_fn_modality_type(
     # add back the type
 
     if return_untransformed:
-        out = [(modality_type, transformed_m, prev_m) for transformed_m, prev_m in zip(out, modalities)]
+        out = [
+            (modality_type, transformed_m, *((spec,) if exists(spec) else ()), prev_m)
+            for (_, spec), transformed_m, prev_m in zip(type_and_specs, out, modalities)
+        ]
     else:
-        out = [(modality_type, transformed_m) for transformed_m in out]
+        out = [
+            (modality_type, transformed_m) if not exists(spec) else (modality_type, transformed_m, spec)
+            for (_, spec), transformed_m in zip(type_and_specs, out)
+        ]
 
     # replace transformed modalities and untree flatten
 
@@ -1103,6 +1199,7 @@ class Transformer(Module):
         times: Scalar | Float['b'] | Float['b n'] | None = None,
         attn_mask: Bool['b i j'] | None = None,
         modality_positions: RawModalityPositions | Int['b m 3'] | None = None,
+        excluded_spans: Int['b m 2'] | None = None,
         is_any_modality: bool | Bool['b n'] | None = None,
         rotary_emb: Tensor | None = None,
         cache: Tensor | None = None,
@@ -1147,11 +1244,11 @@ class Transformer(Module):
                 assert not causal_mask
 
                 if should_use_flex_attn:
-                    transfusion_mask_fn = transfusion_attn_mask(modality_positions)
+                    transfusion_mask_fn = transfusion_attn_mask(modality_positions, excluded_spans = excluded_spans)
                     block_mask = create_block_mask(transfusion_mask_fn, B = batch, H = None, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True, device = device)
                     attn_mask_kwargs.update(block_mask = block_mask)
                 else:
-                    attn_mask = naive_attn_mask(seq_len, modality_positions, device = device)
+                    attn_mask = naive_attn_mask(seq_len, modality_positions, excluded_spans = excluded_spans, device = device)
                     attn_mask_kwargs.update(attn_mask = attn_mask)
 
         # explicit mask is honored even when decoding with a cache - `sample_many` excludes the padded kv cache entries of other samples this way
@@ -1748,7 +1845,7 @@ class Transfusion(Module):
             prompt = [prompt]
 
         elif isinstance(prompt, tuple):
-            modality_type, modality = prompt
+            modality_type, modality, *_ = prompt
 
             mod = self.get_modality_info(modality_type)
 
@@ -1779,7 +1876,7 @@ class Transfusion(Module):
             # resumes from the end of the modality as it would in training
 
             if prompt and not is_tensor(prompt[-1]):
-                last_modality_type, _ = prompt[-1]
+                last_modality_type, _, *_ = prompt[-1]
                 eom_id = self.get_modality_info(last_modality_type).eom_id
                 prompt.append(tensor([eom_id], device = device))
 
@@ -1837,7 +1934,7 @@ class Transfusion(Module):
             decoder_fn.eval()
             samples = apply_fn_modality_type(decoder_fn, samples, modality_type = mod.modality_type)
 
-        return samples
+        return to_named_modality_items(samples)
 
     @torch.no_grad()
     @temp_eval
@@ -1973,7 +2070,7 @@ class Transfusion(Module):
                         # prepare unconditional kv cache for CFG
 
                         uncond_history = [
-                            torch.full_like(item, self.null_text_id) if is_int_tensor(item) else item
+                            null_text_tokens(item, self.null_text_id)
                             for item in modality_sample
                         ]
 
@@ -2068,7 +2165,7 @@ class Transfusion(Module):
         logger.info(f'sampling stopped at length: {curr_length} / {max_length}')
 
         if return_unprocessed_modalities:
-            return modality_sample
+            return to_named_modality_items(modality_sample)
 
         return self.decode_modalities(modality_sample)
 
@@ -2150,7 +2247,7 @@ class Transfusion(Module):
                     seq_len += part.numel()
                     continue
 
-                modality_type, modality = part
+                modality_type, modality, *_ = part
                 num_past_modalities += 1
 
                 mod = self.get_modality_info(modality_type)
@@ -2578,7 +2675,7 @@ class Transfusion(Module):
         samples = [state.sample for state in states]
 
         if return_unprocessed_modalities:
-            return samples
+            return to_named_modality_items(samples)
 
         return self.decode_modalities(samples)
 
@@ -3029,18 +3126,10 @@ class Transfusion(Module):
         if self.training and prob_uncond > 0 and isinstance(modalities, list):
             rand_mask = torch.rand(len(modalities), device = self.device) < prob_uncond
 
-            def to_uncond_sample(sample):
-                uncond = []
-
-                for item in sample:
-                    if is_int_tensor(item):
-                        item = torch.full_like(item, self.null_text_id)
-
-                    uncond.append(item)
-
-                return uncond
-
-            modalities = [to_uncond_sample(sample) if is_uncond else sample for sample, is_uncond in zip(modalities, rand_mask)]
+            modalities = [
+                [null_text_tokens(item, self.null_text_id) for item in sample] if is_uncond else sample
+                for sample, is_uncond in zip(modalities, rand_mask)
+            ]
 
         # need axial pos emb
 
@@ -3055,15 +3144,17 @@ class Transfusion(Module):
             batch_num_modalities = 0
 
             for ind, modality in enumerate(batch_modalities):
+                parsed = parse_modality_item(modality)
 
-                if is_tensor(modality) and modality.is_floating_point():
-                    modality = (0, modality)
-
-                if not isinstance(modality, tuple):
+                if parsed.kind != 'modality':
                     continue
 
-                modality_type, modality_tensor = modality
-                batch_modalities[ind] = modality
+                # standardize bare float tensors to a type 0 modality tuple
+
+                if not isinstance(modality, tuple):
+                    modality = (parsed.modality_type, parsed.tensor)
+                    batch_modalities[ind] = modality
+
                 batch_num_modalities += 1
 
             num_modalities.append(batch_num_modalities)
@@ -3115,7 +3206,10 @@ class Transfusion(Module):
             get_pred_flows,
             get_recon_losses,
             pos_emb_max_axial_dims,
-            total_tokens
+            total_tokens,
+            loss_weights,
+            excluded_spans,
+            flow_weights
         ) = process_modality_batch_fn(
             modalities,
             times,
@@ -3142,6 +3236,13 @@ class Transfusion(Module):
 
         if return_loss:
             text, text_labels = text[:, :-1], text[:, 1:]
+
+            if exists(loss_weights):
+                # align the weights with the labels: labels[i] is the token at buffer position i + 1
+
+                text_weights = loss_weights[:, 1:]
+            else:
+                text_weights = None
 
         # derive is_modality mask for flow on the right tokens + flow loss
 
@@ -3242,6 +3343,7 @@ class Transfusion(Module):
             times = times_cond,
             rotary_emb = rotary_emb,
             modality_positions = modality_positions,
+            excluded_spans = excluded_spans,
             is_any_modality = is_any_modality,
             cache = raw_cache,
             decode_length = decode_length,
@@ -3322,17 +3424,27 @@ class Transfusion(Module):
         # ignore "Image -> Null" mappings.
         text_labels = text_labels.masked_fill(text_labels == self.null_text_id, self.ignore_index)
 
-        text_loss = F.cross_entropy(
-            rearrange(text_logits, 'b n l -> b l n'),
+        text_loss = F.nll_loss(
+            rearrange(text_logits, 'b n l -> b l n').log_softmax(dim = 1),
             text_labels,
-            ignore_index = self.ignore_index
+            ignore_index = self.ignore_index,
+            reduction = 'none'
         )
 
-        text_loss_weight = (text_labels != self.ignore_index).sum() / total_tokens
+        if exists(text_weights):
+            # continuous per-token loss weights - 0 positions contribute nothing
+
+            text_loss = (text_loss * text_weights).sum()
+        else:
+            text_loss = text_loss.sum()
+
+        text_loss = text_loss / total_tokens
 
         # calculate flow losses
 
         flow_losses = []
+
+        modality_weight_vectors = {}
 
         modality_loss_weights = []
 
@@ -3356,10 +3468,13 @@ class Transfusion(Module):
             modality_pred_flow, _ = pack(pred_flow, pack_pattern)
             modality_flows, _ = pack(modality_flows, pack_pattern)
 
-            flow_loss = F.mse_loss(
-                modality_pred_flow,
-                modality_flows
-            )
+            # per-token loss weights
+
+            modality_weight_vectors[modality_id] = flow_weight_vector(flow_weights[modality_id], flows[modality_id], mod.channel_first_latent)
+
+            mse = (modality_pred_flow - modality_flows) ** 2
+
+            flow_loss = (mse * modality_weight_vectors[modality_id]).sum() / total_tokens
 
             flow_losses.append(flow_loss)
 
@@ -3368,10 +3483,10 @@ class Transfusion(Module):
         # only the token positions that are not modalities have autoregressive loss
         # if the batch contains no modalities, there is nothing to compute a flow loss on
 
-        flow_loss = self.zero if not flow_losses else (stack(flow_losses) * modality_loss_weights).sum()
+        flow_loss = self.zero if not flow_losses else sum(flow_losses)
 
         total_loss = (
-            text_loss * text_loss_weight * self.text_loss_weight +
+            text_loss * self.text_loss_weight +
             flow_loss * self.flow_loss_weight
         )
 
@@ -3404,17 +3519,16 @@ class Transfusion(Module):
                 pred_flow, _ = pack(pred_flow, pack_pattern)
                 ema_pred_flow, _ = pack(ema_pred_flow, pack_pattern)
 
-                velocity_match_loss = F.mse_loss(
-                    pred_flow,
-                    ema_pred_flow
-                )
+                mse = (pred_flow - ema_pred_flow) ** 2
+
+                velocity_match_loss = (mse * modality_weight_vectors[modality_id]).sum() / total_tokens
 
                 velocity_match_losses.append(velocity_match_loss)
 
             if velocity_match_losses:
                 total_loss = (
                     total_loss +
-                    (stack(velocity_match_losses) * modality_loss_weights).sum() * self.velocity_consistency_loss_weight
+                    sum(velocity_match_losses) * self.velocity_consistency_loss_weight
                 )
 
         # maybe reconstruction loss

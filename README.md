@@ -243,7 +243,9 @@ samples = model.sample_many(
     cfg_scale = 3.,
 )
 
-action = samples[0][3][1]  # the forced action, of shape (32, 8)
+# modality items come back with named attributes - `.modality_type`, `.tensor`, `.loss_weight`
+
+action = samples[0][3].tensor  # the forced action, of shape (32, 8)
 ```
 
 the batch can mix prompts of different text and video lengths - each sample still gets its forced

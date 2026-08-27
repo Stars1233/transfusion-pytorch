@@ -21,6 +21,7 @@ from transfusion_pytorch.transfusion import (
     apply_fn_modality_type,
     SelfMaskedRepTraining
 )
+from transfusion_pytorch.modality_processing import ModalityItem
 
 @pytest.mark.parametrize('cache_kv', (False, True))
 @pytest.mark.parametrize('use_flex_attn', (False, True))
@@ -653,8 +654,8 @@ def test_e2e_multiple_modalities_interleaved():
 
     for item_cached, item_uncached in zip(sampled_cached, sampled_uncached):
         if isinstance(item_cached, tuple):
-            type_c, tensor_c = item_cached
-            type_u, tensor_u = item_uncached
+            type_c, tensor_c = (item_cached.modality_type, item_cached.tensor) if isinstance(item_cached, ModalityItem) else item_cached
+            type_u, tensor_u = (item_uncached.modality_type, item_uncached.tensor) if isinstance(item_uncached, ModalityItem) else item_uncached
 
             assert type_c == type_u
             assert torch.allclose(tensor_c, tensor_u, atol = 1e-4)
@@ -774,8 +775,15 @@ def assert_sample_equivalence(model, prompt_batch, **kwargs):
 
         for one_part, many_part in zip(one, many):
             if isinstance(one_part, tuple):
-                one_type, one_tensor = one_part
-                many_type, many_tensor = many_part
+                if isinstance(one_part, ModalityItem):
+                    one_type, one_tensor = one_part.modality_type, one_part.tensor
+                else:
+                    one_type, one_tensor = one_part
+
+                if isinstance(many_part, ModalityItem):
+                    many_type, many_tensor = many_part.modality_type, many_part.tensor
+                else:
+                    many_type, many_tensor = many_part
 
                 assert one_type == many_type
                 assert torch.allclose(one_tensor, many_tensor, atol = 1e-4)
@@ -1034,3 +1042,324 @@ def test_sample_force_modality_at_start_equivalent_sample_one_many():
         max_length = 64,
         cfg_scale = 1.
     )
+
+# context only spans - a trailing bool flag on a text tensor or modality tuple marks it as
+# context: attended to, but no loss on any of its tokens
+
+def make_loss_masked_model(strategy = 'grouped', use_flex_attn = False):
+    return Transfusion(
+        num_text_tokens = 16,
+        dim_latent = 16,
+        modality_default_shape = (4, 4),
+        modality_processing = strategy,
+        transformer = dict(
+            dim = 16,
+            depth = 2,
+            dim_head = 8,
+            heads = 2,
+            use_flex_attn = use_flex_attn
+        )
+    ).eval()
+
+def test_loss_masking():
+    # the trailing weight of a sample item - `True` / `1` is the default, `False` / `0` gives no loss,
+    # numbers are loss weights - demonstrated at the e2e level
+
+    model = make_loss_masked_model()
+
+    text = randint(0, 16, (8,))
+    image = randn(4, 4, 16)
+
+    def loss_of(sample, **kwargs):
+        torch.manual_seed(0)
+        return model(sample, times = tensor([[0.5]]), **kwargs)
+
+    loss_default, breakdown_default = loss_of([[text, (0, image), text]], return_breakdown = True)
+
+    # `True` and `1` are the same as the default
+
+    assert torch.allclose(loss_of([[text, (0, image, True), text]]), loss_default)
+    assert torch.allclose(loss_of([[text, (0, image, 1), text]]), loss_default)
+
+    # a `0.5` weight halves the image's contribution to the loss
+
+    loss_half = loss_of([[text, (0, image, 0.5), text]])
+
+    assert 0. < loss_half < loss_default
+
+    # `0` and `False` mask the image out of the loss - `False` also withholds it from attention
+
+    _, breakdown_zero = loss_of([[text, (0, image, 0.), text]], return_breakdown = True)
+    assert breakdown_zero.flow == []
+
+    _, breakdown_false = loss_of([[text, (0, image, False), text]], return_breakdown = True)
+    assert breakdown_false.flow == []
+    assert not torch.equal(breakdown_false.text, breakdown_zero.text) # `False` excludes the span from attention - the suffix text conditions differently
+
+    # a fully masked sample - no flow loss at all, only the [eos] target remains
+
+    loss_masked, breakdown = loss_of([[(text, False), (0, image, False)]], return_breakdown = True)
+    assert breakdown.flow == []
+    assert loss_masked > 0.
+
+def test_per_token_loss_masking():
+    # a Float or Bool tensor on an item gives per-token loss weights over its tokens
+
+    model = make_loss_masked_model()
+
+    image = randn(4, 4, 16)
+
+    def loss_of(sample, **kwargs):
+        torch.manual_seed(0)
+        return model(sample, times = tensor([[0.5]]), **kwargs)
+
+    loss_default, _ = loss_of([[ (0, image) ]], return_breakdown = True)
+
+    # an all-ones mask is the default
+
+    assert torch.allclose(loss_of([[ (0, image, torch.ones(16)) ]]), loss_default)
+
+    # the length is asserted
+
+    with pytest.raises(AssertionError, match = 'per-token loss weights'):
+        model([[(0, image, torch.ones(15))]])
+
+    with pytest.raises(AssertionError, match = 'per-token loss weights'):
+        model([[(randint(0, 16, (8,)), torch.ones(7))]])
+
+    # Bool masks are accepted - only the masked tokens train
+
+    half_mask = torch.linspace(0., 1., 16) > 0.5
+
+    loss_bool, _ = loss_of([[(0, image, half_mask)]], return_breakdown = True)
+    assert 0. < loss_bool < loss_default
+
+    loss_zero, breakdown = loss_of([[(0, image, torch.zeros(16, dtype = torch.bool))]], return_breakdown = True)
+    assert breakdown.flow == []
+    assert loss_zero < loss_bool
+
+def test_modal_loss_weight_specs():
+    # every loss weight form on a modality in one batch - bool, float and per-token Bool / Float
+    # tensors all work together
+
+    model = make_loss_masked_model()
+
+    images = [randn(4, 4, 16) for _ in range(6)]
+
+    def loss_of(specs):
+        batch = [[(0, image, spec)] for image, spec in zip(images, specs)]
+        torch.manual_seed(0)
+        return model(batch, times = tensor([[0.5]] * len(specs)), return_breakdown = True)
+
+    half_mask = torch.linspace(0., 1., 16) > 0.5
+    random_weights = torch.rand(16) * 0.5
+
+    # a multidimensional list works too - flattened to the item's tokens
+
+    grid_mask = [[1., 0., 0., 1.], [0., 1., 1., 0.], [1., 0., 1., 0.], [0., 1., 0., 1.]]
+
+    mixed_specs = [True, 0.5, half_mask, random_weights, False, 0.]
+
+    loss_mixed, breakdown_mixed = loss_of(mixed_specs)
+    loss_defaults, _ = loss_of([1.0] * 6)
+
+    assert breakdown_mixed.flow[0] > 0. # the weighted instances still train
+    assert loss_mixed < loss_defaults   # the masked and weighted instances contribute less
+
+    # a fully masked batch - no flow loss at all
+
+    _, breakdown_masked = loss_of([False, 0., torch.zeros(16, dtype = torch.bool), torch.zeros(16), torch.zeros(16, dtype = torch.bool), torch.zeros(16)])
+    assert breakdown_masked.flow == []
+
+    # Bool and Float tensors of the same values are interchangeable, so are lists
+
+    bool_specs = [half_mask, half_mask, torch.ones(16, dtype = torch.bool), grid_mask, torch.zeros(16, dtype = torch.bool), half_mask]
+    float_specs = [half_mask.float(), half_mask.float(), torch.ones(16), tensor(grid_mask, dtype = torch.float), torch.zeros(16), half_mask.float()]
+
+    _, breakdown_bool = loss_of(bool_specs)
+    _, breakdown_float = loss_of(float_specs)
+
+    assert torch.allclose(breakdown_bool.flow[0], breakdown_float.flow[0])
+
+def test_context_only_spans_survive_encoder():
+    # the weight on a modality must survive the encoders
+
+    model = make_loss_masked_model()
+
+    image = randn(4, 4, 16)
+
+    out = apply_fn_modality_type(nn.Identity(), [(0, image, 0.5), (0, image)], modality_type = 0)
+
+    assert len(out[0]) == 3 and out[0][2] == 0.5
+    assert len(out[1]) == 2 and out[1][0] == 0
+
+    assert model([[(0, image, 0.), (0, randn(4, 4, 16))]]).item() > 0.
+
+def test_loss_masking_with_velocity_consistency():
+    # velocity consistency with a masked demo in the batch - the ema pred flows stay aligned
+
+    mock_encoder = nn.Conv2d(3, 16, 3, padding = 1)
+    mock_decoder = nn.Conv2d(16, 3, 3, padding = 1)
+
+    model = Transfusion(
+        num_text_tokens = 12,
+        dim_latent = 16,
+        channel_first_latent = True,
+        modality_default_shape = (4, 4),
+        modality_encoder = mock_encoder,
+        modality_decoder = mock_decoder,
+        transformer = dict(
+            dim = 16,
+            depth = 1
+        )
+    )
+
+    ema_model = deepcopy(model)
+
+    text_and_images = [
+        [
+            randint(0, 12, (16,)),
+            (0, randn(3, 8, 8), 0.), # masked demo - no loss, still attended
+            randint(0, 12, (8,)),
+            randn(3, 7, 7)
+        ],
+    ]
+
+    loss, breakdown = model(
+        text_and_images,
+        velocity_consistency_ema_model = ema_model,
+        return_breakdown = True
+    )
+
+    loss.backward()
+
+    assert exists(breakdown.velocity)
+
+def test_context_only_spans_flagged_prompts_sampling():
+    # weights on prompt modalities are tolerated by sampling (everything in the prompt is context anyway)
+
+    model = make_loss_masked_model()
+
+    text = randint(0, 16, (3,))
+    video = randn(4, 4, 16)
+
+    sample = model.sample_one(
+        [text, (0, video, True)],
+        force_modality_at_start = (0, (4, 4)),
+        max_length = 64,
+        text_temperature = 0.,
+        cfg_scale = 1.,
+        modality_steps = 4
+    )
+
+    assert isinstance(sample[1], tuple)
+    assert sample[1].modality_type == 0
+    assert torch.allclose(sample[1].tensor, video)
+    assert sample[1].loss_weight is True
+
+    (sample_many_out,) = model.sample_many(
+        [[text, (0, video, True)]],
+        force_modality_at_start = (0, (4, 4)),
+        max_length = 64,
+        text_temperature = 0.,
+        cfg_scale = 1.,
+        modality_steps = 4
+    )
+
+    assert isinstance(sample_many_out[3], tuple)
+    assert sample_many_out[3].modality_type == 0
+    assert sample_many_out[3].tensor.shape == (4, 4, 16)
+
+def test_loss_weight_edge_cases():
+    # the remaining edges of the loss weight / context-only API: per-token weights on text, bare
+    # `(tensor, weight)` specs, mixed weighted batches across processing and attention paths,
+    # and weight specs during sampling
+
+    model = make_loss_masked_model()
+    text = randint(0, 16, (8,))
+    image = randn(4, 4, 16)
+
+    def loss_of(m, sample, **kwargs):
+        torch.manual_seed(0)
+        return m(sample, times = tensor([[0.5]]), **kwargs)
+
+    # per-token weights on text - `(text_tensor, weights)`
+
+    loss_default, _ = loss_of(model, [[text, (0, image)]], return_breakdown = True)
+    loss_masked, _ = loss_of(model, [[(text, tensor([1., 0.] * 4)), (0, image)]], return_breakdown = True)
+
+    assert 0. < loss_masked < loss_default
+
+    with pytest.raises(AssertionError, match = 'per-token loss weights'):
+        model([[(text, tensor([1.] * 9))]])
+
+    # the bare `(tensor, weight)` form - no modality type - runs through a channel first encoder
+
+    mock_encoder = nn.Conv2d(3, 8, 1)
+    mock_decoder = nn.Conv2d(8, 3, 1)
+
+    enc_model = Transfusion(
+        num_text_tokens = 12,
+        dim_latent = 8,
+        channel_first_latent = True,
+        modality_default_shape = (4, 4),
+        modality_encoder = mock_encoder,
+        modality_decoder = mock_decoder,
+        transformer = dict(dim = 16, depth = 1)
+    ).train()
+
+    assert enc_model([[(randn(3, 4, 4), 0.5)]], times = tensor([[0.5]])).item() > 0.
+
+    # weighted, per-token weighted and context-only items mix in one batch - every strategy agrees
+
+    mixed_batch = [
+        [(0, randn(4, 4, 16), 0.5), randint(0, 16, (5,)), (0, randn(4, 4, 16), False)],
+        [(0, randn(4, 4, 16), tensor([0., 1.] * 8)), (randint(0, 16, (4,)), False)],
+    ]
+
+    mixed_times = tensor([[0.3, 0.6], [0.7, 0.8]])
+
+    from transfusion_pytorch.modality_processing import assert_strategies_equivalent
+
+    assert_strategies_equivalent(model, mixed_batch, mixed_times, need_axial_pos_emb = False, return_loss = True, return_embed = False)
+
+    if exists(flex_attention) and cuda_available:
+        # both attention implementations agree on the loss for a context-only span
+
+        flex_batch = [[(0, randn(4, 4, 16, device = 'cuda'), False), randint(0, 16, (5,), device = 'cuda')]]
+
+        torch.manual_seed(0)
+        loss_naive, _ = make_loss_masked_model().cuda()(flex_batch, times = tensor([[0.5]]), return_breakdown = True)
+
+        torch.manual_seed(0)
+        loss_flex, _ = make_loss_masked_model(use_flex_attn = True).cuda()(flex_batch, times = tensor([[0.5]]), return_breakdown = True)
+
+        assert torch.allclose(loss_naive, loss_flex, atol = 1e-5)
+
+    # weighted and zero weight prompt modalities are tolerated during sampling - naive and grouped
+
+    for strategy in ('naive', 'grouped'):
+        strategy_model = make_loss_masked_model(strategy)
+
+        sample = strategy_model.sample_one(
+            [text, (0, image, 0.5)],
+            force_modality_at_start = (0, (4, 4)),
+            max_length = 32,
+            text_temperature = 0.,
+            cfg_scale = 2.,
+            modality_steps = 2
+        )
+
+        assert sample[1].modality_type == 0
+        assert sample[1].loss_weight == 0.5
+
+        zero_sample = strategy_model.sample_one(
+            [(0, image, 0.)],
+            force_modality_at_start = (0, (4, 4)),
+            max_length = 32,
+            text_temperature = 0.,
+            cfg_scale = 1.,
+            modality_steps = 2
+        )
+
+        assert zero_sample[1].loss_weight == 0.

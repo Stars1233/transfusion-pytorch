@@ -43,11 +43,14 @@ from torch import nn
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
+from einx import set_at
 
 from torch_einops_utils import (
     pack_with_inverse,
     pad_at_dim,
-    pad_sequence
+    pad_left_at_dim,
+    pad_sequence,
+    masked_mean
 )
 
 # tensor typing (mirrors transfusion.py, kept local to avoid a circular import)
@@ -66,7 +69,29 @@ Int   = TorchTyping(jaxtyping.Int)
 
 # types
 
-ModalitySample = list[Int[''] | Int['_'] | Float['...'] | tuple[int, Float['...']]]
+class ModalityItem(NamedTuple):
+    # a modality in a sample, with named fields - used by the sampling API for returned samples
+
+    modality_type: int
+    tensor: Float['...']
+    loss_weight: bool | float | Tensor | None = None
+
+ItemLossWeight = float | Tensor
+
+ModalitySample = list[
+    Int[''] | Int['_'] | Float['...'] |
+    tuple[int, Float['...']] | ModalityItem |
+    tuple[Int[''], bool] | tuple[Float['...'], bool] |
+    tuple[int, Float['...'], bool]
+]
+
+class ParsedItem(NamedTuple):
+    # one raw batch entry normalized to its kind, tensor, modality type and trailing loss weight spec
+
+    kind: str # 'text' or 'modality'
+    tensor: Float['...']
+    modality_type: int | None
+    loss_weight: ItemLossWeight | None
 
 GetPredFlows = dict[int, list[Callable[[Tensor], Tensor]]]
 
@@ -134,6 +159,19 @@ class ModalityRecord:
     scatter_offset: int
     length: int
     axial_shape: tuple[int, ...]
+    loss_weight: float | Tensor = 1.0
+    not_attended: bool = False
+
+class TextItem(NamedTuple):
+    # a text chunk in a sample, normalized to its loss weight and whether it is attended to
+
+    tensor: Int['n']
+    loss_weight: ItemLossWeight = 1.0
+    not_attended: bool = False
+
+# one item in a sample, either a text chunk or a modality record - dispatched on `isinstance`
+
+ScanItem = TextItem | ModalityRecord
 
 class ProcessedModalityBatch(NamedTuple):
     text: Int['b n']
@@ -145,6 +183,85 @@ class ProcessedModalityBatch(NamedTuple):
     get_recon_losses: dict[int, list[Callable[[Tensor], Tensor]]]
     pos_emb_max_axial_dims: dict[int, list[Tensor]]
     total_tokens: int | None
+    loss_weights: Tensor | None # per token loss weights over the text buffer - None when the batch is unmasked
+    excluded: Tensor | None # padded (start, end) spans not attended to - None when nothing is excluded
+    flow_weights: dict[int, list[float | Tensor]] # per instance flow loss weights, aligned with the list in `flows`
+
+def parse_modality_item(item) -> ParsedItem:
+    # normalize one batch item to its kind, tensor (warding a lone zero-dim text token to length 1),
+    # modality type and trailing loss weight spec - a number or a per-token tensor / list when given
+
+    def ward_scalar(tensor):
+        return rearrange(tensor, '-> 1') if is_int_tensor(tensor) and tensor.ndim == 0 else tensor
+
+    if isinstance(item, tuple):
+        first, *rest = item
+
+        if isinstance(first, int):
+            # (modality_type, tensor[, loss_weight])
+
+            tensor, weight = rest[0], rest[1] if len(rest) > 1 else None
+            return ParsedItem('modality', ward_scalar(tensor), first, weight)
+
+        # (tensor[, loss_weight])
+
+        weight = rest[0] if rest else None
+        kind = 'text' if is_int_tensor(first) else 'modality'
+        return ParsedItem(kind, ward_scalar(first), 0 if kind == 'modality' else None, weight)
+
+    kind = 'text' if is_int_tensor(item) else 'modality'
+    return ParsedItem(kind, ward_scalar(item), 0 if kind == 'modality' else None, None)
+
+def to_named_modality_item(item) -> ModalityItem | None:
+    # normalize a modality sample entry into its named `ModalityItem`, or None when it is text -
+    # `ModalityItem` inputs pass through the same parse, so everything is accessed uniformly
+
+    parsed = parse_modality_item(item)
+
+    if parsed.kind == 'text':
+        return None
+
+    return ModalityItem(parsed.modality_type, parsed.tensor, parsed.loss_weight)
+
+def normalize_item_spec(spec) -> tuple[ItemLossWeight, bool]:
+    # the trailing value of a sample item, normalized to (loss weight, not attended):
+    #   `True` / `1`   - attend, weight 1 (the default when omitted)
+    #   `False`        - not attended at all, no loss
+    #   number         - loss weight over the whole item; `0` and `0.` give no loss, still attended
+    #   Bool / Float tensor or list - per-token loss weights over the item's tokens, any shape
+    #   (flattened), length asserted
+
+    if not exists(spec):
+        return 1.0, False
+
+    if spec is True:
+        return 1.0, False
+
+    if spec is False:
+        return 0.0, True
+
+    if isinstance(spec, (int, float)):
+        assert not isinstance(spec, bool)
+        return float(spec), False
+
+    if isinstance(spec, (list, tuple)):
+        spec = tensor(spec)
+
+    if is_tensor(spec):
+        assert spec.dtype == torch.bool or spec.is_floating_point(), f'per-token loss weights must be Bool or Float, received {spec.dtype}'
+        return spec.float().reshape(-1), False
+
+    raise AssertionError(f'invalid loss weight for a sample item - must be a bool, number, or a Bool / Float tensor or list over the item tokens, received {spec}')
+
+def weight_is_zero(weight: ItemLossWeight) -> bool:
+    if is_tensor(weight):
+        return bool(weight.sum() == 0.0)
+    return weight == 0.0
+
+def is_withheld(weight: ItemLossWeight, not_attended: bool) -> bool:
+    # an item with a zero (or absent) loss weight - attended to or not - contributes no loss
+
+    return not_attended or weight_is_zero(weight)
 
 def validate_modality(modality_tensor: Tensor, modality_type: int, model) -> None:
     # check the modality sample against the modality info for that type
@@ -174,16 +291,22 @@ def model_to_pred_flow(batch_index, start_index, modality_length, unpack_fn):
 
     return inner
 
-def get_recon_loss(noise, times, modality):
+def get_recon_loss(noise, times, modality, weights = None, channel_first = False):
     # for going from predicted flow -> reconstruction
 
     def inner(pred_flow):
         recon_modality = noise + pred_flow * (1. - times)
-        return F.mse_loss(modality, recon_modality)
+
+        if not exists(weights):
+            return F.mse_loss(modality, recon_modality)
+
+        mse = (recon_modality - modality) ** 2
+
+        return weighted_token_loss(mse, weights, channel_first)
 
     return inner
 
-def get_recon_loss_lazy(noise, noised, times, shape, start, end, slice_):
+def get_recon_loss_lazy(noise, noised, times, shape, start, end, slice_, weights = None, channel_first = False):
     # like `get_recon_loss`, but slices the noise / noised out of the flat per-type tensors
     # only when the loss is actually evaluated (reconstruction loss is off by default)
 
@@ -191,9 +314,29 @@ def get_recon_loss_lazy(noise, noised, times, shape, start, end, slice_):
         noise_instance = slice_(noise, start, end).reshape(shape)
         noised_instance = slice_(noised, start, end).reshape(shape)
         recon_modality = noise_instance + pred_flow * (1. - times)
-        return F.mse_loss(noised_instance, recon_modality)
+
+        if not exists(weights):
+            return F.mse_loss(noised_instance, recon_modality)
+
+        mse = (recon_modality - noised_instance) ** 2
+
+        return weighted_token_loss(mse, weights, channel_first)
 
     return inner
+
+def weighted_token_loss(token_loss: Tensor, weights, channel_first: bool) -> Tensor:
+    # weighted mean of a per-token loss over the token axis, where the trailing token dimension
+    # for channel first lives on dim 1, else the last dim
+
+    if is_tensor(weights):
+        mask = rearrange(weights, 't -> 1 t') if channel_first else rearrange(weights, 't -> t 1')
+
+        if weights.dtype == torch.bool:
+            return masked_mean(token_loss, mask = mask)
+
+        return (token_loss * mask).sum() / max(mask.sum(), 1e-8)
+
+    return token_loss.mean() * weights
 
 def group_records_by_shape(records) -> dict[tuple[int, ...], list[ModalityRecord]]:
     shape_groups = defaultdict(list)
@@ -207,7 +350,7 @@ def scan_batch_for_structure(
     modalities: list[ModalitySample],
     times,
     model
-):
+) -> tuple[list[ModalityRecord], list[list[ScanItem]]]:
     # shared pass 1 - walk each sample for structure only, no gpu allocations in the hot path.
     # offsets, meta tokens and positions cannot be computed here: they depend on the modality
     # token lengths *after* the `latent_to_model` projection, which may downsample (unet style
@@ -218,32 +361,33 @@ def scan_batch_for_structure(
 
     for batch_index, batch_modalities in enumerate(modalities):
 
-        items = []
+        items: list[ScanItem] = []
         modality_index = 0
 
         for modality in batch_modalities:
-            is_text = not isinstance(modality, tuple)
-
-            if is_text:
-                modality_tensor = modality
-            else:
-                modality_type, modality_tensor, *_ = modality
-                validate_modality(modality_tensor, modality_type, model)
-
-            # auto ward against scalars (lone start end tokens)
-
-            if is_int_tensor(modality_tensor) and modality_tensor.ndim == 0:
-                modality_tensor = rearrange(modality_tensor, '-> 1')
+            parsed = parse_modality_item(modality)
+            loss_weight, not_attended = normalize_item_spec(parsed.loss_weight)
 
             # handle text
 
-            if is_text:
-                assert modality_tensor.ndim == 1 and is_int_tensor(modality_tensor)
-                items.append(('text', modality_tensor))
+            if parsed.kind == 'text':
+                chunk = parsed.tensor
+
+                assert chunk.ndim == 1 and is_int_tensor(chunk)
+
+                if is_tensor(loss_weight):
+                    assert loss_weight.numel() == chunk.shape[0], f'per-token loss weights must match the number of text tokens ({chunk.shape[0]}), received {loss_weight.numel()}'
+
+                items.append(TextItem(chunk, loss_weight, not_attended))
                 continue
 
             # otherwise handle a modality
             # each modality instance gets its own noise level, indexed by its position in the sample
+
+            modality_tensor = parsed.tensor
+            modality_type = parsed.modality_type
+
+            validate_modality(modality_tensor, modality_type, model)
 
             mod = model.get_modality_info(modality_type)
 
@@ -253,10 +397,10 @@ def scan_batch_for_structure(
             axial_shape = modality_tensor.shape[1:] if mod.channel_first_latent else modality_tensor.shape[:-1]
             modality_length = math.prod(axial_shape)
 
-            record = ModalityRecord(batch_index, modality_type, modality_tensor, modality_time, -1, modality_length, axial_shape)
+            record = ModalityRecord(batch_index, modality_type, modality_tensor, modality_time, -1, modality_length, axial_shape, loss_weight, not_attended)
 
             modality_records.append(record)
-            items.append(('modality', record))
+            items.append(record)
 
         sample_items.append(items)
 
@@ -287,7 +431,7 @@ def get_cached_meta_tokens(model, device, shape_str, modality_type):
     return cache[key]
 
 def assemble_batch(
-    sample_items,
+    sample_items: list[list[ScanItem]],
     model,
     device,
     *,
@@ -302,6 +446,8 @@ def assemble_batch(
     text_chunks = [] # per sample, list of (offset, int tensor) to be scattered into the text buffer
     modality_positions = []
     modality_pos_emb = []
+    weight_chunks = [] # per sample, list of (start, end, loss weight) spanning the text buffer
+    excluded_spans = [] # per sample, list of (start, end) buffer spans not attended to
     pos_emb_max_axial_dims: dict[int, list[Tensor]] = defaultdict(list)
 
     total_lens = []
@@ -312,14 +458,23 @@ def assemble_batch(
         sample_text_chunks = []
         sample_modality_positions = []
         sample_modality_pos_emb = []
+        sample_weight_chunks = []
+        sample_excluded_spans = []
 
         for item in items:
 
-            if item[0] == 'text':
-                chunk = item[1]
+            if isinstance(item, TextItem):
+                chunk, weight, not_attended = item.tensor, item.loss_weight, item.not_attended
 
                 sample_text_chunks.append((offset, chunk))
+
+                if not_attended or is_tensor(weight) or weight != 1.0:
+                    sample_weight_chunks.append((offset, offset + chunk.shape[0], 0. if not_attended else weight))
+
                 offset += chunk.shape[0]
+
+                if not_attended:
+                    sample_excluded_spans.append((offset - chunk.shape[0], offset))
 
                 if need_axial_pos_emb:
                     sample_modality_pos_emb.append(('zeros', chunk.shape[0]))
@@ -328,7 +483,7 @@ def assemble_batch(
 
             # otherwise a modality instance
 
-            record = item[1]
+            record: ModalityRecord = item
             mod = model.get_modality_info(record.modality_type)
 
             precede_modality_tokens = succeed_modality_tokens = 0
@@ -354,6 +509,20 @@ def assemble_batch(
 
             sample_modality_positions.append((record.modality_type, scatter_offset, record.length))
 
+            # per-token loss weights cover the modality tokens; a scalar weight covers the whole
+            # span (meta tokens included), and `not_attended` items are excluded entirely
+
+            weight = record.loss_weight
+
+            if is_tensor(weight):
+                assert weight.numel() == record.length, f'per-token loss weights must match the number of modality tokens ({record.length}), received {weight.numel()}'
+                sample_weight_chunks.append((scatter_offset, scatter_offset + record.length, weight))
+            elif weight != 1.0:
+                sample_weight_chunks.append((offset, offset + record.length + precede_modality_tokens + succeed_modality_tokens, weight))
+
+            if record.not_attended:
+                sample_excluded_spans.append((offset, offset + record.length + precede_modality_tokens + succeed_modality_tokens))
+
             # handle axial positional embedding
 
             if need_axial_pos_emb:
@@ -370,11 +539,58 @@ def assemble_batch(
         total_lens.append(offset)
         text_chunks.append(sample_text_chunks)
         modality_positions.append(sample_modality_positions)
+        weight_chunks.append(sample_weight_chunks)
+        excluded_spans.append(sample_excluded_spans)
 
         if need_axial_pos_emb:
             modality_pos_emb.append(sample_modality_pos_emb)
 
-    return text_chunks, modality_positions, modality_pos_emb, pos_emb_max_axial_dims, total_lens
+    return text_chunks, modality_positions, modality_pos_emb, pos_emb_max_axial_dims, total_lens, weight_chunks, excluded_spans
+
+def build_loss_weights(weight_chunks, batch, max_len, device) -> Tensor | None:
+    # per-sample chunks over the text buffer -> padded per-token loss weight grid, or None when all default
+
+    if not any(weight_chunks):
+        return None
+
+    weights = torch.ones((batch, max_len), device = device)
+
+    for batch_index, chunks in enumerate(weight_chunks):
+        if not chunks:
+            continue
+
+        positions, values = [], []
+
+        for start, end, weight in chunks:
+            positions.append(torch.arange(start, end, device = device))
+
+            if is_tensor(weight):
+                values.append(weight.to(device = device, dtype = torch.float))
+            else:
+                values.append(torch.full((end - start,), weight, device = device))
+
+        weights[batch_index] = set_at('[n], s [1], s -> [n]', weights[batch_index], rearrange(cat(positions), 's -> s 1'), cat(values))
+
+    return weights
+
+def build_excluded_spans(excluded_spans, device, dtype = torch.long) -> Tensor | None:
+    # per-sample spans over the text buffer -> padded (start, end) coordinate tensor, or None when there are none
+
+    if not any(excluded_spans):
+        return None
+
+    max_spans = max(len(spans) for spans in excluded_spans)
+
+    padded = []
+
+    for batch_spans in excluded_spans:
+        spans = tensor(batch_spans, device = device, dtype = dtype) if batch_spans else torch.zeros((0, 2), device = device, dtype = dtype)
+        # left pad rows of zero spans - a (0, 0) span never matches any position
+
+        spans = pad_left_at_dim(spans, max_spans - spans.shape[0], dim = -2, value = 0)
+        padded.append(spans)
+
+    return stack(padded)
 
 def process_modality_batch_naive(
     modalities: list[ModalitySample],
@@ -396,6 +612,8 @@ def process_modality_batch_naive(
     modality_positions = []
     modality_tokens = []
     modality_pos_emb = []
+    weight_chunks = []
+    excluded_spans = []
 
     text = []
 
@@ -405,6 +623,8 @@ def process_modality_batch_naive(
 
     get_recon_losses = defaultdict(list)
 
+    flow_weights = defaultdict(list)
+
     pos_emb_max_axial_dims: dict[int, list[Tensor]] = defaultdict(list)
 
     for batch_index, batch_modalities in enumerate(modalities):
@@ -413,40 +633,37 @@ def process_modality_batch_naive(
         batch_modality_positions = []
         batch_modality_tokens = []
         batch_modality_pos_emb = []
+        batch_weight_chunks = []
+        batch_excluded_spans = []
 
         batch_text = []
 
         offset = 0
 
         for modality in batch_modalities:
-
-            # if non-text modality detected and not given as a tuple
-            # cast to (int, Tensor) where int is defaulted to type 0 (convenience for one modality)
-
-            is_text = not isinstance(modality, tuple)
-
-            if is_text:
-                modality_tensor = modality
-            else:
-                modality_type, modality_tensor, *_ = modality
-                mod = model.get_modality_info(modality_type)
-                validate_modality(modality_tensor, modality_type, model)
-
-            # auto ward against scalars (lone start end tokens)
-
-            if is_int_tensor(modality_tensor) and modality_tensor.ndim == 0:
-                modality_tensor = rearrange(modality_tensor, '-> 1')
+            parsed = parse_modality_item(modality)
+            weight, not_attended = normalize_item_spec(parsed.loss_weight)
+            modality_tensor = parsed.tensor
 
             # handle text
 
-            if is_text:
+            if parsed.kind == 'text':
                 assert modality_tensor.ndim == 1 and is_int_tensor(modality_tensor)
                 text_length = modality_tensor.shape[0]
+
+                if is_tensor(weight):
+                    assert weight.numel() == text_length, f'per-token loss weights must match the number of text tokens ({text_length}), received {weight.numel()}'
 
                 batch_text.append(modality_tensor)
                 zeros = torch.zeros(text_length, dim, device = device)
 
                 batch_modality_tokens.append(zeros)
+
+                if not_attended or is_tensor(weight) or weight != 1.0:
+                    batch_weight_chunks.append((offset, offset + text_length, 0. if not_attended else weight))
+
+                if not_attended:
+                    batch_excluded_spans.append((offset, offset + text_length))
 
                 offset += text_length
 
@@ -458,8 +675,16 @@ def process_modality_batch_naive(
             # otherwise handle a modality
             # each modality instance gets its own time column, indexed by its position in the sample
 
+            modality_type = parsed.modality_type
+
+            validate_modality(modality_tensor, modality_type, model)
+
+            mod = model.get_modality_info(modality_type)
+
             modality_time = times[batch_index, modality_index]
             modality_index += 1
+
+            participates_in_loss = not is_withheld(weight, not_attended)
 
             # noise
 
@@ -472,15 +697,14 @@ def process_modality_batch_naive(
 
                 modality_flow = modality_tensor - noise
 
-                # append to flow for loss
-
-                flows[modality_type].append(modality_flow)
-
                 modality_tensor = noised_modality
 
-                # store function for deriving reconstruction loss from decoder
+                # items with a zero (or absent) loss weight - attended to, but no loss
 
-                get_recon_losses[modality_type].append(get_recon_loss(noise, modality_time, modality_tensor))
+                if participates_in_loss:
+                    flows[modality_type].append(modality_flow)
+                    flow_weights[modality_type].append(weight.to(device = device, dtype = torch.float) if is_tensor(weight) else weight)
+                    get_recon_losses[modality_type].append(get_recon_loss(noise, modality_time, modality_tensor, weight, mod.channel_first_latent))
 
             # go through maybe encoder
 
@@ -490,6 +714,9 @@ def process_modality_batch_naive(
 
             modality_shape_tuple = modality_tensor.shape[:-1]
             modality_length = math.prod(modality_shape_tuple)
+
+            if is_tensor(weight):
+                assert weight.numel() == modality_length, f'per-token loss weights must match the number of modality tokens ({modality_length}), received {weight.numel()}'
 
             text_tensor = torch.full((modality_length,), -1, device = device) # text is all -1 here, so text labels are not learned on
 
@@ -534,7 +761,18 @@ def process_modality_batch_naive(
 
             # store function for extracting flow later
 
-            get_pred_flows[modality_type].append(inverse_fn)
+            if not return_loss or participates_in_loss:
+                get_pred_flows[modality_type].append(inverse_fn)
+
+            # the whole span (meta tokens included) is not attended and has no loss when excluded
+
+            if not_attended:
+                batch_excluded_spans.append((offset, offset + modality_length + precede_modality_tokens + succeed_modality_tokens))
+
+            if is_tensor(weight):
+                batch_weight_chunks.append((offset + precede_modality_tokens, offset + precede_modality_tokens + modality_length, weight))
+            elif weight != 1.0:
+                batch_weight_chunks.append((offset, offset + modality_length + precede_modality_tokens + succeed_modality_tokens, weight))
 
             # increment offset
 
@@ -566,12 +804,17 @@ def process_modality_batch_naive(
 
         modality_tokens.append(cat(batch_modality_tokens))
         modality_positions.append(batch_modality_positions)
+        weight_chunks.append(batch_weight_chunks)
+        excluded_spans.append(batch_excluded_spans)
 
     total_tokens = sum([t.numel() for t in text]) if return_loss else None
 
     text = pad_sequence(text, value = -1)
 
     modality_tokens = pad_sequence(modality_tokens, dim = -2, value = 0.)
+
+    loss_weights = build_loss_weights(weight_chunks, batch = len(modalities), max_len = text.shape[-1], device = device) if return_loss else None
+    excluded = build_excluded_spans(excluded_spans, device) if return_loss else None
 
     if not need_axial_pos_emb:
         modality_pos_emb = None
@@ -585,7 +828,10 @@ def process_modality_batch_naive(
         get_pred_flows = get_pred_flows,
         get_recon_losses = get_recon_losses,
         pos_emb_max_axial_dims = pos_emb_max_axial_dims,
-        total_tokens = total_tokens
+        total_tokens = total_tokens,
+        loss_weights = loss_weights,
+        excluded = excluded,
+        flow_weights = flow_weights
     )
 
 class ProcessedRecord(NamedTuple):
@@ -769,11 +1015,18 @@ def build_record_closures(
     return_loss,
     flows,
     get_pred_flows,
-    get_recon_losses
+    get_recon_losses,
+    flow_weights
 ):
     # build the flow extraction functions and loss closures in scan order, so per type lists stay aligned
 
     for record in records:
+
+        # items with a zero (or absent) loss weight - attended to or not - are excluded
+        # from flow targets, pred flow closures and recon losses
+
+        if return_loss and is_withheld(record.loss_weight, record.not_attended):
+            continue
 
         processed = processed_by_record[record]
 
@@ -795,13 +1048,19 @@ def build_record_closures(
         if return_loss:
             flows[modality_type].append(processed.flow)
 
-            if processed.slice_ is not None:
+            weight = record.loss_weight.to(device = model.device, dtype = torch.float) if is_tensor(record.loss_weight) else record.loss_weight
+
+            flow_weights[modality_type].append(weight)
+
+            channel_first = model.get_modality_info(record.modality_type).channel_first_latent
+
+            if exists(processed.slice_):
                 # flat-style processing: the noise / noised live in the flat per-type tensor, slice lazily
 
-                get_recon_losses[modality_type].append(get_recon_loss_lazy(processed.noise, processed.noised, processed.time, processed.shape, processed.start, processed.end, processed.slice_))
+                get_recon_losses[modality_type].append(get_recon_loss_lazy(processed.noise, processed.noised, processed.time, processed.shape, processed.start, processed.end, processed.slice_, weight, channel_first))
 
             else:
-                get_recon_losses[modality_type].append(get_recon_loss(processed.noise, processed.time, processed.noised))
+                get_recon_losses[modality_type].append(get_recon_loss(processed.noise, processed.time, processed.noised, weight, channel_first))
 
 def process_type_grouped(records: list[ModalityRecord], model, dim, return_loss) -> dict[ModalityRecord, ProcessedRecord]:
     # process each (type, shape) group of 2+ instances with one batched noise, noising and
@@ -880,6 +1139,7 @@ def _process_modality_batch_with(
     flows = defaultdict(list)
     get_pred_flows: GetPredFlows = defaultdict(list)
     get_recon_losses = defaultdict(list)
+    flow_weights = defaultdict(list)
 
     processed_by_record = {}
 
@@ -890,7 +1150,7 @@ def _process_modality_batch_with(
     # modality lengths, then build the flow extraction functions and loss closures in scan
     # order, so per type lists stay aligned
 
-    text_chunks, modality_positions, modality_pos_emb, pos_emb_max_axial_dims, total_lens = assemble_batch(
+    text_chunks, modality_positions, modality_pos_emb, pos_emb_max_axial_dims, total_lens, weight_chunks, excluded_spans = assemble_batch(
         sample_items,
         model,
         device,
@@ -899,12 +1159,15 @@ def _process_modality_batch_with(
     )
 
     for modality_type, records in records_by_type.items():
-        build_record_closures(records, processed_by_record, model, dim, modality_type, return_loss, flows, get_pred_flows, get_recon_losses)
+        build_record_closures(records, processed_by_record, model, dim, modality_type, return_loss, flows, get_pred_flows, get_recon_losses, flow_weights)
 
     # pass 4 - assemble each sample into a single pre-allocated buffer with per-chunk scatter,
     # replacing per-chunk allocations, padding and cats
 
     max_len = max(total_lens)
+
+    loss_weights = build_loss_weights(weight_chunks, batch, max_len, device) if return_loss else None
+    excluded = build_excluded_spans(excluded_spans, device) if return_loss else None
 
     text_bufs = torch.full((batch, max_len), -1, device = device)
     modality_bufs = torch.zeros((batch, max_len, dim), device = device)
@@ -931,7 +1194,10 @@ def _process_modality_batch_with(
         get_pred_flows = get_pred_flows,
         get_recon_losses = get_recon_losses,
         pos_emb_max_axial_dims = pos_emb_max_axial_dims,
-        total_tokens = total_tokens
+        total_tokens = total_tokens,
+        loss_weights = loss_weights,
+        excluded = excluded,
+        flow_weights = flow_weights
     )
 
 def process_modality_batch(
@@ -1091,31 +1357,17 @@ def structure_signature(
         batch_size += 1
 
         for modality in batch_modalities:
-            is_text = not isinstance(modality, tuple)
+            parsed = parse_modality_item(modality)
 
-            if is_text:
-                modality_tensor = modality
-
-                if not is_int_tensor(modality_tensor):
-                    modality_type = 0 # bare float tensor, treated as a type 0 modality
-                    is_text = False
-            else:
-                modality_type, modality_tensor, *_ = modality
-
-            # auto ward against scalars (lone start end tokens)
-
-            if is_int_tensor(modality_tensor) and modality_tensor.ndim == 0:
-                modality_tensor = rearrange(modality_tensor, '-> 1')
-
-            if is_text:
-                total_tokens += modality_tensor.shape[0]
+            if parsed.kind == 'text':
+                total_tokens += parsed.tensor.shape[0]
                 continue
 
-            mod = model.get_modality_info(modality_type)
-            axial_shape = modality_tensor.shape[1:] if mod.channel_first_latent else modality_tensor.shape[:-1]
+            mod = model.get_modality_info(parsed.modality_type)
+            axial_shape = parsed.tensor.shape[1:] if mod.channel_first_latent else parsed.tensor.shape[:-1]
 
             total_tokens += math.prod(axial_shape)
-            type_shape_counts[modality_type][axial_shape] += 1
+            type_shape_counts[parsed.modality_type][axial_shape] += 1
 
     structure = tuple(
         (modality_type, shape, count)
@@ -1287,6 +1539,22 @@ def assert_strategies_equivalent(
         assert torch.equal(candidate.modality_tokens, reference.modality_tokens), f'{name}: modality tokens mismatch'
         assert candidate.modality_positions == reference.modality_positions, f'{name}: positions mismatch'
         assert candidate.total_tokens == reference.total_tokens, f'{name}: total tokens mismatch'
+
+        for mask_name in ('loss_weights', 'excluded'):
+            mask_reference, mask_candidate = getattr(reference, mask_name), getattr(candidate, mask_name)
+            assert (mask_candidate is None) == (mask_reference is None), f'{name}: {mask_name} presence mismatch'
+
+            if exists(mask_reference):
+                assert torch.equal(mask_candidate, mask_reference), f'{name}: {mask_name} mismatch'
+
+        for modality_type in reference.flow_weights:
+            weights_reference, weights_candidate = reference.flow_weights[modality_type], candidate.flow_weights[modality_type]
+
+            assert len(weights_reference) == len(weights_candidate), f'{name}: flow weights length mismatch'
+
+            for weight_reference, weight_candidate in zip(weights_reference, weights_candidate):
+                weights_match = torch.equal(weight_reference, weight_candidate) if is_tensor(weight_reference) else weight_reference == weight_candidate
+                assert weights_match, f'{name}: flow weights mismatch'
 
         embed = torch.randn(len(modalities), reference.text.shape[-1], model.dim, device = model.device)
 

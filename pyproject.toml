@@ -1,12 +1,12 @@
 [project]
 name = "transfusion-pytorch"
-version = "0.19.5"
+version = "0.19.6"
 description = "Transfusion in Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
 ]
 readme = "README.md"
-requires-python = ">= 3.8"
+requires-python = ">= 3.10"
 license = { file = "LICENSE" }
 keywords = [
     'artificial intelligence',
@@ -20,20 +20,20 @@ classifiers = [
     'Intended Audience :: Developers',
     'Topic :: Scientific/Engineering :: Artificial Intelligence',
     'License :: OSI Approved :: MIT License',
-    'Programming Language :: Python :: 3.8',
+    'Programming Language :: Python :: 3.10',
 ]
 
 dependencies = [
     'axial-positional-embedding>=0.3.5',
     'beartype',
-    'einx>=0.3.0',
+    'einx>=0.4.0',
     'einops>=0.8.0',
     'ema-pytorch',
     'jaxtyping',
     'loguru',
     'rotary_embedding_torch>=0.8.4',
     'torchdiffeq',
-    'torch-einops-utils>=0.1.12',
+    'torch-einops-utils>=0.1.22',
     'torch>=2.0',
     'tqdm'
 ]
