@@ -234,18 +234,21 @@ model = Transfusion(
     )
 )
 
-text = torch.randint(0, 256, (16,))    # some text prompt
-video = torch.randn(16, 4, 4, 4)       # channel first video latent - (latent dim, frames, height, width)
+# ICL for human to robot - a human demonstrates the task on video, then the robot actions are generated in-context, no finetuning
+
+text = torch.randint(0, 256, (16,))                                 # some text prompt
+human_demo_video = torch.randn(16, 4, 4, 4)                         # channel first video latent - (latent dim, frames, height, width)
 
 samples = model.sample_many(
-    [[text, (0, video)]],              # one prompt: text, then video
-    force_modality_at_start = (1, (32,)),  # force a 1d action of chunk length 32
+    [[text, (0, human_demo_video)]],                                # one prompt: text, then the human demonstration video
+    force_modality_at_start = (1, (32,)),                           # force a 1d robot action chunk of length 32
+    return_without_prompt = True,                                   # just the decoded modalities, no prompt
     cfg_scale = 3.,
 )
 
 # modality items come back with named attributes - `.modality_type`, `.tensor`, `.loss_weight`
 
-action = samples[0][3].tensor  # the forced action, of shape (32, 8)
+robot_actions = samples[0][0].tensor                                # the forced robot actions, of shape (32, 8)
 ```
 
 the batch can mix prompts of different text and video lengths - each sample still gets its forced

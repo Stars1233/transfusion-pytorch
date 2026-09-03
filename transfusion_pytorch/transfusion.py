@@ -1951,6 +1951,7 @@ class Transfusion(Module):
         init_modality_noise: Float['n d'] | None = None,
         modality_steps = 16,
         return_unprocessed_modalities = False,
+        return_without_prompt = False,
         cfg_scale = 3.
     ) -> ModalitySample:
 
@@ -1971,6 +1972,8 @@ class Transfusion(Module):
             prompt,
             force_modality_at_start
         )
+
+        num_prompt_parts = len(modality_sample)  # for slicing off the prompt at the end
 
         *_, last_modality_sample = modality_sample
 
@@ -2164,6 +2167,9 @@ class Transfusion(Module):
 
         logger.info(f'sampling stopped at length: {curr_length} / {max_length}')
 
+        if return_without_prompt:
+            modality_sample = [part for part in modality_sample[num_prompt_parts:] if not is_tensor(part)]
+
         if return_unprocessed_modalities:
             return to_named_modality_items(modality_sample)
 
@@ -2187,6 +2193,7 @@ class Transfusion(Module):
         init_modality_noise: Float['n d'] | None = None,
         modality_steps = 16,
         return_unprocessed_modalities = False,
+        return_without_prompt = False,
         cfg_scale = 3.
     ) -> list[ModalitySample]:
 
@@ -2212,6 +2219,9 @@ class Transfusion(Module):
         `force_modality_at_start` - an int (modality type) or a (modality_type, shape) tuple - makes
         every sample in the batch start off by decoding that modality (skipping text decoding), with
         the shape taken from the tuple, `fixed_modality_shape`, or the modality's default shape.
+
+        `return_without_prompt` - only the modalities decoded during sampling, prompt and text
+        stripped.
         """
 
         device = self.device
@@ -2228,12 +2238,15 @@ class Transfusion(Module):
 
         states = []
         sample_seq_lens = []
+        num_prompt_parts = []
 
         for prompt in prompts:
             sample, forced_modality_id, forced_modality_shape = self.prepare_prompt_sample(
                 prompt,
                 force_modality_at_start
             )
+
+            num_prompt_parts.append(len(sample))  # for slicing off the prompt at the end
 
             # count the tokens in the sample - and the rotary position collapse of each modality
             # instance (all tokens of a modality share a single position)
@@ -2673,6 +2686,12 @@ class Transfusion(Module):
             logger.info(f'sampling stopped at length: {state.num_tokens} / {max_length}')
 
         samples = [state.sample for state in states]
+
+        if return_without_prompt:
+            samples = [
+                [part for part in sample[num_prompt_parts:] if not is_tensor(part)]
+                for sample, num_prompt_parts in zip(samples, num_prompt_parts)
+            ]
 
         if return_unprocessed_modalities:
             return to_named_modality_items(samples)
