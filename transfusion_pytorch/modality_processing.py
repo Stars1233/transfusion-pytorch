@@ -1,30 +1,13 @@
 from __future__ import annotations
 
 """
-modality processing strategies for `Transfusion`
+modality processing strategies for transfusion
 
-processing turns a batch of interspersed text + modality samples into one joint sequence,
-with the bookkeeping the training / sampling loop needs (positions, flow and loss closures,
-positional embeddings).
-
-strategies live in the `PROCESSING_STRATEGIES` registry below, pickable via
-`Transfusion(..., modality_processing = ...)`. `'auto'` (the default) measures the candidate
-strategies on the actual batch and dispatches to the fastest.
-
-  naive    per-instance loop, the reference baseline
-  grouped  one batched noise + noising + projection per same (type, shape) group
-  flat     one noise + noising + projection for the whole modality type, any shapes
-  hybrid   same-shaped groups batched, singletons of a type via the flat path
-  auto     router that times the candidates on the batch and picks the fastest
-
-to add a strategy: write `process_modality_batch_<name>(...)` with the same signature, register
-it in `PROCESSING_STRATEGIES`, and it will be picked up by `benchmark_processing.py` and the
-equivalence checks in the test suite automatically.
-
-all strategies compute the modality token lengths and the [meta] shape string *after* the
-`latent_to_model` projection, so downsampling (unet style) encoders are supported. the `flat`
-strategy relies on the projection being elementwise (linear) over the token axis - when it is
-not (e.g. a conv encoder), it falls back to per-instance processing.
+  naive    - per-instance reference baseline
+  grouped  - batches same (type, shape) groups
+  flat     - batches whole modality type across varying shapes
+  hybrid   - groups same shapes, falls back to flat for singletons
+  auto     - (default) dynamically routes to fastest strategy for batch
 """
 
 import math
@@ -37,7 +20,6 @@ from functools import partial
 from typing import Callable, NamedTuple
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, tensor, is_tensor, cat, stack
 from torch import nn
 
@@ -49,8 +31,7 @@ from torch_einops_utils import (
     pack_with_inverse,
     pad_at_dim,
     pad_left_at_dim,
-    pad_sequence,
-    masked_mean
+    pad_sequence
 )
 
 # tensor typing (mirrors transfusion.py, kept local to avoid a circular import)
@@ -291,52 +272,35 @@ def model_to_pred_flow(batch_index, start_index, modality_length, unpack_fn):
 
     return inner
 
+def weighted_token_loss(token_loss: Tensor, weights = None, channel_first = False) -> Tensor:
+    weights = default(weights, 1.)
+
+    if not is_tensor(weights):
+        return token_loss.mean() * weights
+
+    pattern = 'c ... -> c (...)' if channel_first else '... c -> (...) c'
+    mask_pattern = 't -> 1 t' if channel_first else 't -> t 1'
+
+    flat_loss = rearrange(token_loss, pattern)
+    mask = rearrange(weights, mask_pattern)
+    dim_latent = token_loss.shape[0 if channel_first else -1]
+
+    return (flat_loss * mask).sum() / (mask.sum().clamp_min(1e-8) * dim_latent)
+
 def get_recon_loss(noise, times, modality, weights = None, channel_first = False):
-    # for going from predicted flow -> reconstruction
-
     def inner(pred_flow):
-        recon_modality = noise + pred_flow * (1. - times)
-
-        if not exists(weights):
-            return F.mse_loss(modality, recon_modality)
-
-        mse = (recon_modality - modality) ** 2
-
-        return weighted_token_loss(mse, weights, channel_first)
+        recon = noise + pred_flow * (1. - times)
+        return weighted_token_loss((recon - modality) ** 2, weights, channel_first)
 
     return inner
 
 def get_recon_loss_lazy(noise, noised, times, shape, start, end, slice_, weights = None, channel_first = False):
-    # like `get_recon_loss`, but slices the noise / noised out of the flat per-type tensors
-    # only when the loss is actually evaluated (reconstruction loss is off by default)
-
     def inner(pred_flow):
         noise_instance = slice_(noise, start, end).reshape(shape)
         noised_instance = slice_(noised, start, end).reshape(shape)
-        recon_modality = noise_instance + pred_flow * (1. - times)
-
-        if not exists(weights):
-            return F.mse_loss(noised_instance, recon_modality)
-
-        mse = (recon_modality - noised_instance) ** 2
-
-        return weighted_token_loss(mse, weights, channel_first)
+        return get_recon_loss(noise_instance, times, noised_instance, weights, channel_first)(pred_flow)
 
     return inner
-
-def weighted_token_loss(token_loss: Tensor, weights, channel_first: bool) -> Tensor:
-    # weighted mean of a per-token loss over the token axis, where the trailing token dimension
-    # for channel first lives on dim 1, else the last dim
-
-    if is_tensor(weights):
-        mask = rearrange(weights, 't -> 1 t') if channel_first else rearrange(weights, 't -> t 1')
-
-        if weights.dtype == torch.bool:
-            return masked_mean(token_loss, mask = mask)
-
-        return (token_loss * mask).sum() / max(mask.sum(), 1e-8)
-
-    return token_loss.mean() * weights
 
 def group_records_by_shape(records) -> dict[tuple[int, ...], list[ModalityRecord]]:
     shape_groups = defaultdict(list)
@@ -1568,5 +1532,15 @@ def assert_strategies_equivalent(
             for modality_type in reference.flows:
                 for flow_reference, flow_candidate in zip(reference.flows[modality_type], candidate.flows[modality_type]):
                     assert torch.equal(flow_reference.reshape(-1), flow_candidate.reshape(-1)), f'{name}: flow targets mismatch'
+
+            for modality_type in reference.get_recon_losses:
+                assert modality_type in candidate.get_recon_losses, f'{name}: missing modality type {modality_type} in recon losses'
+
+                mod = model.get_modality_info(modality_type)
+
+                for pred_fn, recon_ref, recon_cand in zip(reference.get_pred_flows[modality_type], reference.get_recon_losses[modality_type], candidate.get_recon_losses[modality_type]):
+                    pred_flow = pred_fn(embed)
+                    pred_flow = add_temp_batch_dim(mod.model_to_latent)(pred_flow)
+                    assert torch.allclose(recon_ref(pred_flow), recon_cand(pred_flow), atol = 1e-5), f'{name}: recon loss closures mismatch'
 
     return outputs

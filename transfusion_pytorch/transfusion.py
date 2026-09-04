@@ -2756,7 +2756,7 @@ class Transfusion(Module):
         logits = self.to_text_logits(embed)
 
         if not return_loss:
-            ret = (logits,)
+            ret = (embed if return_embed else logits,)
 
             if return_kv_cache:
                 ret = (*ret, kv_cache)
@@ -3032,8 +3032,7 @@ class Transfusion(Module):
 
         # decode
 
-        if exists(mod.decoder):
-            mod.decoder.eval()
+        if not return_unprocessed_modalities and exists(mod.decoder):
             sampled_modality = mod.decoder(sampled_modality)
 
         return sampled_modality
@@ -3103,25 +3102,26 @@ class Transfusion(Module):
             return self.forward_text(modalities, **forward_text_kwargs)
 
         if is_modality_only:
-            assert return_loss
-
-            forward_modality_kwargs = dict(
+            return self.forward_modality(
+                modalities,
+                times = times,
                 modality_type = modality_type,
-                velocity_consistency_ema_model = velocity_consistency_ema_model
+                velocity_consistency_ema_model = velocity_consistency_ema_model,
+                velocity_consistency_delta_time = velocity_consistency_delta_time,
+                return_loss = return_loss,
+                return_loss_breakdown = return_breakdown
             )
-
-            return self.forward_modality(modalities, **forward_modality_kwargs)
 
         batch = len(modalities)
         device = self.device
         tensor_ = partial(tensor, device = device)
 
-        # save a copy for ema model for velocity matching
+        # save a copy for ema model for velocity matching, before sos / eos and cfg are added
+
         velocity_modalities = modalities
 
-        if need_velocity_matching:
-            if isinstance(velocity_modalities, list):
-                velocity_modalities = [modality.copy() for modality in velocity_modalities]
+        if need_velocity_matching and isinstance(velocity_modalities, list):
+            velocity_modalities = [modality.copy() for modality in velocity_modalities]
 
         # defensively shallow copy out inner lists to prevent in-place mutation of user input
         if isinstance(modalities, list):
@@ -3650,7 +3650,7 @@ class SelfMaskedRepTraining(Module):
         if self.use_asymmetric_dropout:
             set_dropout_(self.student, self.student_dropout_rate)
 
-        student_loss, student_hiddens, student_times = self.student(
+        student_loss, *_, student_hiddens, student_times = self.student(
             *args,
             return_loss = True,
             return_hiddens = True,
@@ -3671,7 +3671,7 @@ class SelfMaskedRepTraining(Module):
             set_dropout_(self.teacher.ema_model, self.teacher_dropout_rate)
 
         with torch.no_grad():
-            _, teacher_hiddens = self.teacher.ema_model(
+            _, *_, teacher_hiddens = self.teacher.ema_model(
                 *args,
                 times = student_times,
                 return_loss = True,

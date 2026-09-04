@@ -1363,3 +1363,49 @@ def test_loss_weight_edge_cases():
         )
 
         assert zero_sample[1].loss_weight == 0.
+
+def test_forward_text_return_embed():
+    model = Transfusion(
+        num_text_tokens = 100,
+        transformer = dict(dim = 32, depth = 1)
+    )
+
+    text = randint(0, 100, (2, 8))
+    embed = model(text, return_loss = False, return_embed = True)
+    assert embed.shape == (2, 8, 32)
+
+def test_generate_modality_only_unprocessed():
+    mock_decoder = nn.Conv2d(16, 3, 3, padding = 1)
+
+    model = Transfusion(
+        num_text_tokens = 0,
+        dim_latent = 16,
+        channel_first_latent = True,
+        modality_default_shape = (4, 4),
+        modality_decoder = mock_decoder,
+        transformer = dict(dim = 16, depth = 1)
+    )
+
+    latent = model.generate_modality_only(modality_steps = 2, return_unprocessed_modalities = True)
+    assert latent.shape == (1, 16, 4, 4)
+
+    decoded = model.generate_modality_only(modality_steps = 2, return_unprocessed_modalities = False)
+    assert decoded.shape == (1, 3, 4, 4)
+
+def test_modality_only_forward_options():
+    model = Transfusion(
+        num_text_tokens = 0,
+        dim_latent = 16,
+        channel_first_latent = True,
+        modality_default_shape = (4, 4),
+        transformer = dict(dim = 16, depth = 1)
+    )
+
+    images = randn(2, 16, 4, 4)
+    times = tensor([0.2, 0.8])
+
+    pred_flow = model(images, times = times, return_loss = False)
+    assert pred_flow.shape == images.shape
+
+    loss, breakdown = model(images, times = times, return_breakdown = True)
+    assert exists(loss) and exists(breakdown)

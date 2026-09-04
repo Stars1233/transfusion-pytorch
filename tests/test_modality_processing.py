@@ -15,7 +15,8 @@ from transfusion_pytorch.modality_processing import (
     structure_signature,
     StrategyRouter,
     ROUTER,
-    process_modality_batch_auto
+    process_modality_batch_auto,
+    weighted_token_loss
 )
 
 def build_model(**overrides):
@@ -554,3 +555,63 @@ def test_unet_encoder_end_to_end_auto_training():
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
+
+# weighted token loss & reconstruction loss with per-token weights
+
+def test_weighted_token_loss_multidimensional_modalities():
+    # all-ones per-token weight must equal scalar 1.0 weight and default None (no channel scaling bug)
+
+    for channel_first in (False, True):
+        token_loss = randn(4, 4, 16).abs() if not channel_first else randn(16, 4, 4).abs()
+
+        loss = weighted_token_loss(token_loss, randn(16).abs(), channel_first = channel_first)
+        assert torch.isfinite(loss)
+
+        loss_ones = weighted_token_loss(token_loss, torch.ones(16), channel_first = channel_first)
+        loss_scalar = weighted_token_loss(token_loss, 1.0, channel_first = channel_first)
+        loss_none = weighted_token_loss(token_loss, channel_first = channel_first)
+
+        assert torch.allclose(loss_ones, loss_scalar)
+        assert torch.allclose(loss_ones, loss_none)
+
+def test_reconstruction_loss_with_per_token_weights_all_strategies():
+    # end-to-end training with reconstruction_loss_weight > 0 and per-token weights on 2D images
+
+    batch = [
+        [randint(0, 8, (4,)), (0, randn(16, 4, 4), torch.rand(16)), randint(0, 8, (2,))],
+        [randint(0, 8, (3,)), (0, randn(16, 4, 4)), (0, randn(16, 4, 4), torch.rand(16))]
+    ]
+
+    for strategy in ('naive', 'grouped', 'flat', 'hybrid', 'auto'):
+        model = Transfusion(
+            num_text_tokens = 8,
+            dim_latent = 16,
+            channel_first_latent = True,
+            modality_default_shape = (4, 4),
+            reconstruction_loss_weight = 0.1,
+            modality_processing = strategy,
+            transformer = dict(dim = 16, depth = 1, use_flex_attn = False),
+        )
+
+        loss = model(batch)
+        assert torch.isfinite(loss)
+        loss.backward()
+
+def test_reconstruction_loss_strategies_equivalence_with_per_token_weights():
+    # every strategy produces equivalent recon loss closures on per-token weighted batches
+    for channel_first in (False, True):
+        model = build_model(
+            dim_latent = 16,
+            modality_default_shape = (4, 4),
+            channel_first_latent = channel_first,
+            reconstruction_loss_weight = 0.1
+        )
+        shape = (16, 4, 4) if channel_first else (4, 4, 16)
+        w = torch.rand(16)
+        batch = [
+            [randint(0, 8, (4,)), (0, randn(*shape), w), randint(0, 8, (2,))],
+            [randint(0, 8, (3,)), (0, randn(*shape)), (0, randn(*shape), w)]
+        ]
+        times = tensor([[0.3, 0.7], [0.4, 0.8]])
+
+        assert_strategies_equivalent(model, batch, times, need_axial_pos_emb = False, return_loss = True, return_embed = False)
